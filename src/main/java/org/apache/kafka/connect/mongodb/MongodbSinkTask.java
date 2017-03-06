@@ -1,12 +1,13 @@
 package org.apache.kafka.connect.mongodb;
 
-import com.mongodb.MongoClient;
-import com.mongodb.client.MongoCollection;
-import com.mongodb.client.MongoDatabase;
-import com.mongodb.client.model.Filters;
-import com.mongodb.client.model.UpdateOneModel;
-import com.mongodb.client.model.UpdateOptions;
-import com.mongodb.client.model.WriteModel;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.connect.data.Struct;
@@ -15,10 +16,19 @@ import org.apache.kafka.connect.sink.SinkRecord;
 import org.apache.kafka.connect.sink.SinkTask;
 import org.apache.kafka.connect.utils.SchemaUtils;
 import org.bson.Document;
+import org.bson.conversions.Bson;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.*;
+import com.mongodb.MongoClient;
+import com.mongodb.client.MongoCollection;
+import com.mongodb.client.MongoDatabase;
+import com.mongodb.client.model.Filters;
+import com.mongodb.client.model.IndexOptions;
+import com.mongodb.client.model.Indexes;
+import com.mongodb.client.model.UpdateOneModel;
+import com.mongodb.client.model.UpdateOptions;
+import com.mongodb.client.model.WriteModel;
 
 /**
  * MongodbSinkTask is a Task that takes records loaded from Kafka and sends them to
@@ -97,20 +107,46 @@ public class MongodbSinkTask extends SinkTask {
             for (int j = 0; j < bulkSize && i < records.size(); j++, i++) {
                 SinkRecord record = records.get(i);
                 Map<String, Object> jsonMap = SchemaUtils.toJsonMap((Struct) record.value());
+                               
                 String topic = record.topic();
+                
+                Map<String, Object> jsonKeyMap = null;
+                boolean isKeyedTopic = (record.key() != null);
+				if (isKeyedTopic) {
+                	jsonKeyMap = createUniqueIndexForKey(record, topic);
+                }
 
                 if (bulks.get(topic) == null) {
                     bulks.put(topic, new ArrayList<WriteModel<Document>>());
                 }
 
-                Document newDocument = new Document(jsonMap)
-                        .append("_id", record.kafkaOffset());
-
-                log.trace("Adding to bulk: {}", newDocument.toString());
-                bulks.get(topic).add(new UpdateOneModel<Document>(
-                        Filters.eq("_id", record.kafkaOffset()),
-                        new Document("$set", newDocument),
-                        new UpdateOptions().upsert(true)));
+                
+                if ( isKeyedTopic ) {
+                	Document newDocument = new Document(jsonMap)
+                            .append("offset", record.kafkaOffset());
+                	List<Bson> filters = new ArrayList<Bson>();
+                	
+                	Iterator<String> keys = jsonKeyMap.keySet().iterator();          
+                	while (keys.hasNext()){
+                		String key = keys.next();
+                		newDocument.append(key, jsonKeyMap.get(key));
+                		filters.add(Filters.eq(key, jsonKeyMap.get(key)));
+                	}
+                	
+                	log.trace("Adding to bulk: {}", newDocument.toString());
+                	bulks.get(topic).add(new UpdateOneModel<Document>(
+                			Filters.and(filters),
+                			new Document("$set", newDocument),
+                			new UpdateOptions().upsert(true)));
+                } else {
+                	Document newDocument = new Document(jsonMap)
+                            .append("_id", record.kafkaOffset());
+                	log.trace("Adding to bulk: {}", newDocument.toString());
+                	bulks.get(topic).add(new UpdateOneModel<Document>(
+                			Filters.eq("_id", record.kafkaOffset()),
+                			new Document("$set", newDocument),
+                			new UpdateOptions().upsert(true)));
+                }
             }
             i--;
             log.trace("Executing bulk");
@@ -123,6 +159,19 @@ public class MongodbSinkTask extends SinkTask {
             }
         }
     }
+
+	private Map<String, Object> createUniqueIndexForKey(SinkRecord record, String topic) {
+		Map<String, Object> jsonKeyMap;
+		jsonKeyMap = SchemaUtils.toJsonMap((Struct) record.key());
+		
+		List<Bson> indexes = new ArrayList<Bson>();
+		Iterator<String> keys = jsonKeyMap.keySet().iterator();          
+		while (keys.hasNext()){
+			indexes.add(Indexes.ascending(keys.next()));
+		}
+		mapping.get(topic).createIndex(Indexes.compoundIndex(indexes),new IndexOptions().unique(true));
+		return jsonKeyMap;
+	}
 
     @Override
     public void flush(Map<TopicPartition, OffsetAndMetadata> map) {
